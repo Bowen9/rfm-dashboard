@@ -31,6 +31,7 @@ import numpy as np
 import streamlit as st
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, davies_bouldin_score
 
 
 def parse_dates(customer_df: pd.DataFrame, transactions_df: pd.DataFrame) -> None:
@@ -89,6 +90,30 @@ def cluster_customers(rfm: pd.DataFrame, n_clusters: int) -> tuple[pd.DataFrame,
     return rfm, model, scaler
 
 
+def compute_cluster_quality(scaled_features: np.ndarray, labels: np.ndarray) -> tuple[float, float]:
+    """Compute clustering quality metrics for the given labels.
+
+    Returns the silhouette score and Davies–Bouldin index.  If there
+    are fewer than 2 clusters or not enough samples, returns (nan,
+    nan).
+    """
+    if labels.ndim > 1:
+        labels = labels.ravel()
+    # At least 2 clusters and each cluster must have at least one sample
+    unique_clusters = np.unique(labels)
+    if len(unique_clusters) < 2 or len(scaled_features) < 2:
+        return float('nan'), float('nan')
+    try:
+        sil = silhouette_score(scaled_features, labels)
+    except Exception:
+        sil = float('nan')
+    try:
+        dbi = davies_bouldin_score(scaled_features, labels)
+    except Exception:
+        dbi = float('nan')
+    return sil, dbi
+
+
 def merge_profiles(customer_df: pd.DataFrame, rfm: pd.DataFrame) -> pd.DataFrame:
     """Merge RFM and cluster labels back to customer data."""
     df = customer_df.copy()
@@ -143,6 +168,9 @@ def main() -> None:
         rfm = compute_rfm(transactions_df)
         # Cluster customers
         rfm, model, scaler = cluster_customers(rfm, n_clusters=n_clusters)
+        # Compute cluster quality metrics on scaled RFM features
+        scaled_features = scaler.transform(rfm[['RECENCY', 'FREQUENCY', 'MONETARY']])
+        sil_score, dbi_score = compute_cluster_quality(scaled_features, rfm['CLUSTER'])
         # Merge results back to customers
         enriched = merge_profiles(customer_df, rfm)
         # Cluster summary
@@ -151,7 +179,36 @@ def main() -> None:
         # Sidebar cluster filter
         clusters = sorted(enriched['CLUSTER'].dropna().unique().tolist())
         selected_clusters = st.sidebar.multiselect('Filter Clusters', options=clusters, default=clusters)
-        filtered = enriched[enriched['CLUSTER'].isin(selected_clusters)]
+
+        # Age filter (if AGE column exists)
+        if 'AGE' in enriched.columns and not enriched['AGE'].dropna().empty:
+            age_min = int(enriched['AGE'].dropna().min())
+            age_max = int(enriched['AGE'].dropna().max())
+            age_range = st.sidebar.slider('Age Range', min_value=age_min, max_value=age_max, value=(age_min, age_max))
+        else:
+            age_range = (0, 120)
+
+        # Gender filter
+        genders = sorted(enriched['SEX'].dropna().str.title().unique().tolist())
+        selected_genders = st.sidebar.multiselect('Filter Gender', options=genders, default=genders)
+
+        # Account type filter
+        acct_types = sorted(enriched['ACCOUNT_TYPE'].dropna().unique().tolist())
+        selected_acct_types = st.sidebar.multiselect('Filter Account Type', options=acct_types, default=acct_types)
+
+        # Apply filters
+        filtered = enriched[
+            (enriched['CLUSTER'].isin(selected_clusters)) &
+            (enriched['AGE'].between(age_range[0], age_range[1], inclusive='both')) &
+            (enriched['SEX'].str.title().isin(selected_genders)) &
+            (enriched['ACCOUNT_TYPE'].isin(selected_acct_types))
+        ]
+
+        # Display cluster quality metrics in sidebar
+        st.sidebar.markdown('---')
+        st.sidebar.write('**Cluster Quality Metrics**')
+        st.sidebar.metric('Silhouette Score', f"{sil_score:.3f}" if sil_score == sil_score else 'N/A')
+        st.sidebar.metric('Davies–Bouldin Index', f"{dbi_score:.3f}" if dbi_score == dbi_score else 'N/A')
 
         # Display summary
         st.subheader('Cluster Profile Summary')
@@ -167,7 +224,6 @@ def main() -> None:
         with col_freq:
             st.write('**Transaction Frequency (log scale)**')
             freq_hist_fig = io.BytesIO()
-            # Using matplotlib to create histogram for log scale
             import matplotlib.pyplot as plt
             plt.figure(figsize=(4,3))
             plt.hist(filtered['FREQUENCY'].dropna(), bins=50)
