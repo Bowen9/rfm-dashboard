@@ -31,7 +31,7 @@ import numpy as np
 import streamlit as st
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score, davies_bouldin_score
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 
 
 def parse_dates(customer_df: pd.DataFrame, transactions_df: pd.DataFrame) -> None:
@@ -80,9 +80,65 @@ def compute_rfm(transactions_df: pd.DataFrame, reference_date: str = '2025-06-16
     return rfm
 
 
-def cluster_customers(rfm: pd.DataFrame, n_clusters: int) -> tuple[pd.DataFrame, KMeans, StandardScaler]:
-    """Standardise RFM metrics and apply KMeans clustering."""
-    features = rfm[['RECENCY', 'FREQUENCY', 'MONETARY']]
+def compute_additional_features(transactions_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute behavioural features beyond basic RFM for each account.
+
+    Features include counts of 'Money In' and 'Money Out' transactions,
+    the ratio of money-in to total money-in + money-out, and channel
+    mix ratios for each channel (e.g. APP, Third Party, USSD, WEB).
+
+    Parameters
+    ----------
+    transactions_df : DataFrame
+        Transactions data with ACCOUNT_NUMBER, TRANSACTION_NAME,
+        CHANAL, and TXNID columns.
+
+    Returns
+    -------
+    DataFrame
+        A DataFrame indexed by ACCOUNT_NUMBER containing the
+        additional behavioural features.
+    """
+    # Count Money In and Money Out transactions
+    money_in = transactions_df.groupby('ACCOUNT_NUMBER')['TRANSACTION_NAME'].apply(lambda x: (x == 'Money In').sum())
+    money_in = money_in.rename('money_in_count')
+    money_out = transactions_df.groupby('ACCOUNT_NUMBER')['TRANSACTION_NAME'].apply(lambda x: (x == 'Money Out').sum())
+    money_out = money_out.rename('money_out_count')
+    total_basic = money_in + money_out
+    money_in_ratio = money_in.div(total_basic.replace(0, np.nan))
+    money_in_ratio = money_in_ratio.rename('money_in_ratio')
+    # Channel mix counts and ratios
+    channel_counts = transactions_df.pivot_table(index='ACCOUNT_NUMBER', columns='CHANAL', values='TXNID', aggfunc='count', fill_value=0)
+    channel_totals = channel_counts.sum(axis=1)
+    channel_ratios = channel_counts.div(channel_totals.replace(0, np.nan), axis=0)
+    channel_ratios = channel_ratios.add_suffix('_ratio')
+    # Combine features
+    features = pd.concat([money_in, money_out, money_in_ratio, channel_ratios], axis=1)
+    return features.reset_index()
+
+
+def cluster_customers(rfm: pd.DataFrame, n_clusters: int, feature_cols: list[str]) -> tuple[pd.DataFrame, KMeans, StandardScaler]:
+    """Standardise selected feature columns and apply KMeans clustering.
+
+    Parameters
+    ----------
+    rfm : DataFrame
+        DataFrame containing the feature columns to be used for clustering.
+    n_clusters : int
+        The number of clusters to form.
+    feature_cols : list of str
+        Names of columns in rfm to be used for clustering.
+
+    Returns
+    -------
+    rfm : DataFrame
+        The input DataFrame with an added CLUSTER column.
+    model : KMeans
+        The fitted KMeans model.
+    scaler : StandardScaler
+        The fitted scaler used for feature standardisation.
+    """
+    features = rfm[feature_cols].fillna(0)
     scaler = StandardScaler()
     scaled = scaler.fit_transform(features)
     model = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
@@ -90,28 +146,45 @@ def cluster_customers(rfm: pd.DataFrame, n_clusters: int) -> tuple[pd.DataFrame,
     return rfm, model, scaler
 
 
-def compute_cluster_quality(scaled_features: np.ndarray, labels: np.ndarray) -> tuple[float, float]:
+def compute_cluster_quality(scaled_features: np.ndarray, labels: np.ndarray) -> tuple[float, float, float]:
     """Compute clustering quality metrics for the given labels.
 
-    Returns the silhouette score and Davies–Bouldin index.  If there
-    are fewer than 2 clusters or not enough samples, returns (nan,
-    nan).
+    Returns the silhouette score, Davies–Bouldin index (lower is better)
+    and Calinski–Harabasz index (higher is better).  If there are
+    fewer than two clusters or insufficient samples, returns NaNs.
+
+    Parameters
+    ----------
+    scaled_features : array-like
+        Standardised feature matrix used for clustering.
+    labels : array-like
+        Cluster labels assigned to each sample.
+
+    Returns
+    -------
+    tuple of floats
+        (silhouette_score, davies_bouldin_index, calinski_harabasz_index)
     """
-    if labels.ndim > 1:
-        labels = labels.ravel()
-    # At least 2 clusters and each cluster must have at least one sample
+    labels = np.asarray(labels).ravel()
     unique_clusters = np.unique(labels)
-    if len(unique_clusters) < 2 or len(scaled_features) < 2:
-        return float('nan'), float('nan')
+    if len(unique_clusters) < 2 or scaled_features.shape[0] < 2:
+        return float('nan'), float('nan'), float('nan')
+    # Compute Silhouette score
     try:
         sil = silhouette_score(scaled_features, labels)
     except Exception:
         sil = float('nan')
+    # Compute Davies–Bouldin index
     try:
         dbi = davies_bouldin_score(scaled_features, labels)
     except Exception:
         dbi = float('nan')
-    return sil, dbi
+    # Compute Calinski–Harabasz index
+    try:
+        ch = calinski_harabasz_score(scaled_features, labels)
+    except Exception:
+        ch = float('nan')
+    return sil, dbi, ch
 
 
 def merge_profiles(customer_df: pd.DataFrame, rfm: pd.DataFrame) -> pd.DataFrame:
@@ -124,12 +197,17 @@ def merge_profiles(customer_df: pd.DataFrame, rfm: pd.DataFrame) -> pd.DataFrame
 
 def compute_cluster_summary(df: pd.DataFrame) -> pd.DataFrame:
     """Summarise count, average age, pct female, avg frequency and monetary for each cluster."""
+    # Additional metrics: avg_txn_value (MONETARY / FREQUENCY) and money_in_ratio if present
+    def pct_fem(s):
+        return (s.str.lower() == 'female').mean() if not s.isnull().all() else np.nan
     summary = df.groupby('CLUSTER').agg(
         count=('ACCOUNT_NUMBER', 'count'),
         avg_age=('AGE', 'mean'),
-        pct_female=('SEX', lambda x: (x.str.lower() == 'female').mean()),
+        pct_female=('SEX', pct_fem),
         avg_frequency=('FREQUENCY', 'mean'),
-        avg_monetary=('MONETARY', 'mean')
+        avg_monetary=('MONETARY', 'mean'),
+        avg_txn_value=('avg_txn_value', 'mean'),
+        money_in_ratio=('money_in_ratio', 'mean')
     ).round(2)
     return summary
 
@@ -152,6 +230,8 @@ def main() -> None:
 
     # Choose number of clusters
     n_clusters = st.sidebar.slider('Number of Clusters', min_value=2, max_value=10, value=5, step=1)
+    # Toggle for behavioural features
+    use_extra = st.sidebar.checkbox('Use behavioural features (advanced)', value=False)
 
     if customer_file is not None and transactions_file is not None:
         # Read uploaded files into DataFrames
@@ -166,11 +246,26 @@ def main() -> None:
         compute_age(customer_df)
         # Compute RFM metrics
         rfm = compute_rfm(transactions_df)
-        # Cluster customers
-        rfm, model, scaler = cluster_customers(rfm, n_clusters=n_clusters)
-        # Compute cluster quality metrics on scaled RFM features
-        scaled_features = scaler.transform(rfm[['RECENCY', 'FREQUENCY', 'MONETARY']])
-        sil_score, dbi_score = compute_cluster_quality(scaled_features, rfm['CLUSTER'])
+        # Compute additional behavioural features and merge
+        extra = compute_additional_features(transactions_df)
+        rfm = rfm.merge(extra, on='ACCOUNT_NUMBER', how='left')
+        # Compute average transaction value per account
+        rfm['avg_txn_value'] = rfm['MONETARY'] / rfm['FREQUENCY'].replace(0, np.nan)
+        # Determine feature columns for clustering
+        base_cols = ['RECENCY', 'FREQUENCY', 'MONETARY']
+        feature_cols = base_cols.copy()
+        if use_extra:
+            # Use all numeric columns except identifier and cluster
+            extra_cols = [c for c in rfm.columns if c not in ['ACCOUNT_NUMBER'] + base_cols + ['CLUSTER']]
+            feature_cols.extend(extra_cols)
+        # Cluster customers using selected features
+        rfm, model, scaler = cluster_customers(rfm, n_clusters=n_clusters, feature_cols=feature_cols)
+        # Compute cluster quality metrics on scaled features
+        try:
+            scaled_features = scaler.transform(rfm[feature_cols].fillna(0))
+            sil_score, dbi_score, ch_score = compute_cluster_quality(scaled_features, rfm['CLUSTER'])
+        except Exception:
+            sil_score, dbi_score, ch_score = float('nan'), float('nan'), float('nan')
         # Merge results back to customers
         enriched = merge_profiles(customer_df, rfm)
         # Cluster summary
@@ -209,6 +304,7 @@ def main() -> None:
         st.sidebar.write('**Cluster Quality Metrics**')
         st.sidebar.metric('Silhouette Score', f"{sil_score:.3f}" if sil_score == sil_score else 'N/A')
         st.sidebar.metric('Davies–Bouldin Index', f"{dbi_score:.3f}" if dbi_score == dbi_score else 'N/A')
+        st.sidebar.metric('Calinski–Harabasz Index', f"{ch_score:.3f}" if ch_score == ch_score else 'N/A (higher is better)')
 
         # Display summary
         st.subheader('Cluster Profile Summary')
